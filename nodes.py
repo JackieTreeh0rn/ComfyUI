@@ -914,7 +914,7 @@ class CLIPLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
-                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos"], ),
+                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2"], ),
                               },
                 "optional": {
                               "device": (["default", "cpu"], {"advanced": True}),
@@ -941,6 +941,8 @@ class CLIPLoader:
             clip_type = comfy.sd.CLIPType.PIXART
         elif type == "cosmos":
             clip_type = comfy.sd.CLIPType.COSMOS
+        elif type == "lumina2":
+            clip_type = comfy.sd.CLIPType.LUMINA2
         else:
             clip_type = comfy.sd.CLIPType.STABLE_DIFFUSION
 
@@ -1062,7 +1064,8 @@ class StyleModelApply:
         for t in conditioning:
             (txt, keys) = t
             keys = keys.copy()
-            if strength_type == "attn_bias" and strength != 1.0:
+            # even if the strength is 1.0 (i.e, no change), if there's already a mask, we have to add to it
+            if strength_type == "attn_bias" and strength != 1.0 and "attention_mask" not in keys:
                 # math.log raises an error if the argument is zero
                 # torch.log returns -inf, which is what we want
                 attn_bias = torch.log(torch.Tensor([strength]))
