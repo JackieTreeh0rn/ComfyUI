@@ -9,39 +9,22 @@ from einops import repeat
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope
+from comfy.ldm.modules.diffusionmodules.mmdit import RMSNorm
 import comfy.ldm.common_dit
 import comfy.model_management
+
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.type(torch.float32)
 
     # calculation
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
-
-
-class WanRMSNorm(nn.Module):
-
-    def __init__(self, dim, eps=1e-5, device=None, dtype=None):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
-
-    def forward(self, x):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
-        return self._norm(x.float()).type_as(x) * comfy.model_management.cast_to(self.weight, dtype=x.dtype, device=x.device)
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
 class WanSelfAttention(nn.Module):
@@ -66,8 +49,8 @@ class WanSelfAttention(nn.Module):
         self.k = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
         self.v = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
         self.o = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.norm_q = WanRMSNorm(dim, eps=eps, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
+        self.norm_q = RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
 
     def forward(self, x, freqs):
         r"""
@@ -131,7 +114,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
         self.v_img = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
         # self.alpha = nn.Parameter(torch.zeros((1, )))
-        self.norm_k_img = WanRMSNorm(dim, eps=eps, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
+        self.norm_k_img = RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
 
     def forward(self, x, context):
         r"""
@@ -229,14 +212,10 @@ class WanAttentionBlock(nn.Module):
 
         x = x + y * e[2]
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, e):
-            x = x + self.cross_attn(self.norm3(x), context)
-            y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
-            x = x + y * e[5]
-            return x
-
-        x = cross_attn_ffn(x, context, e)
+        # cross-attention & ffn
+        x = x + self.cross_attn(self.norm3(x), context)
+        y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
+        x = x + y * e[5]
         return x
 
 
@@ -370,7 +349,7 @@ class WanModel(torch.nn.Module):
 
         # embeddings
         self.patch_embedding = operations.Conv3d(
-            in_dim, dim, kernel_size=patch_size, stride=patch_size, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+            in_dim, dim, kernel_size=patch_size, stride=patch_size, device=operation_settings.get("device"), dtype=torch.float32)
         self.text_embedding = nn.Sequential(
             operations.Linear(text_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.GELU(approximate='tanh'),
             operations.Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
@@ -395,6 +374,8 @@ class WanModel(torch.nn.Module):
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim, operation_settings=operation_settings)
+        else:
+            self.img_emb = None
 
     def forward_orig(
         self,
@@ -426,7 +407,7 @@ class WanModel(torch.nn.Module):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         # embeddings
-        x = self.patch_embedding(x)
+        x = self.patch_embedding(x.float()).to(x.dtype)
         grid_sizes = x.shape[2:]
         x = x.flatten(2).transpose(1, 2)
 
@@ -436,9 +417,9 @@ class WanModel(torch.nn.Module):
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
         # context
-        context = self.text_embedding(torch.cat([context, context.new_zeros(context.size(0), self.text_len - context.size(1), context.size(2))], dim=1))
+        context = self.text_embedding(context)
 
-        if clip_fea is not None:
+        if clip_fea is not None and self.img_emb is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
@@ -457,7 +438,6 @@ class WanModel(torch.nn.Module):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return x
-        # return [u.float() for u in x]
 
     def forward(self, x, timestep, context, clip_fea=None, **kwargs):
         bs, c, t, h, w = x.shape
